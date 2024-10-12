@@ -41,57 +41,78 @@ const Message = struct {
     threadId: []u8,
 };
 
-pub fn listEmails(self: *Gmail) !void {
-    // Prepare the request URL
+const MAX_PARTS = 10; // Adjust this value based on your expected maximum number of parts
+
+pub const MessageValue = struct {
+    parts: [MAX_PARTS][]const u8,
+    parts_count: usize,
+    body: []const u8,
+};
+
+pub fn listEmails(self: *Gmail) !std.ArrayList(MessageValue) {
     const path = "/gmail/v1/users/me/messages";
 
-    // Send the GET request
     var response_buffer = try self.sendAuthenticatedRequest(path, .GET);
     defer response_buffer.deinit();
 
-    // Parse and print the response
     const response = response_buffer.items;
-    std.debug.print("Response: {s}\n", .{response});
     const parsed = try std.json.parseFromSlice(MessagesResponse, self.allocator.*, response, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
+
+    var message_values = std.ArrayList(MessageValue).init(self.allocator.*);
 
     for (parsed.value.messages[0..10]) |message| {
         var mpath: [60]u8 = undefined;
         const mpath_str = try std.fmt.bufPrint(&mpath, "/gmail/v1/users/me/messages/{s}", .{message.id});
         var message_response_buffer = try self.sendAuthenticatedRequest(mpath_str, .GET);
         defer message_response_buffer.deinit();
-
-        // Parse and print the response
+        var messageValue: MessageValue = .{
+            .parts = undefined,
+            .parts_count = 0,
+            .body = undefined,
+        };
         const message_response = message_response_buffer.items;
-        std.debug.print("Response: {s}\n", .{message_response});
         const parsed_message = try std.json.parseFromSlice(GmailMessage, self.allocator.*, message_response, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
         defer parsed_message.deinit();
         if (parsed_message.value.payload.?.body.?.data) |data| {
             const decoded = decodeBase64Url(self.allocator.*, data) catch |err| {
                 std.debug.print("Error decoding base64url: {}\n", .{err});
-                return;
+                return error.DecodingError;
             };
             defer self.allocator.free(decoded);
-            std.debug.print("\n\n\n\n\ndecoded: {s}\n\n\n\n\n", .{decoded});
+            messageValue.body = decoded;
         }
+        if (parsed_message.value.payload.?.parts) |parts| {
+            for (parts) |part| {
+                if (part.body.?.data) |data| {
+                    if (messageValue.parts_count >= MAX_PARTS) {
+                        std.debug.print("Warning: Exceeded maximum number of parts\n", .{});
+                        break;
+                    }
+                    const decoded = decodeBase64Url(self.allocator.*, data) catch |err| {
+                        std.debug.print("Error decoding base64url: {}\n", .{err});
+                        return error.DecodingError;
+                    };
+                    defer self.allocator.free(decoded);
+                    messageValue.parts[messageValue.parts_count] = decoded;
+                    messageValue.parts_count += 1;
+                }
+            }
+        }
+        try message_values.append(messageValue);
     }
+    return message_values;
 }
 
-fn decodeBase64Url(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
-    // Define the base64url alphabet
+fn decodeBase64Url(allocator: std.mem.Allocator, encoded: []const u8) ![]const u8 {
     const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".*;
     const base64url = std.base64.Base64Decoder.init(alphabet, '=');
 
-    // Calculate the maximum possible decoded length
     const max_len = try base64url.calcSizeForSlice(encoded);
 
-    // Allocate buffer for decoded data
     var decoded = try allocator.alloc(u8, max_len);
     errdefer allocator.free(decoded);
 
-    // Perform the decoding
     try base64url.decode(decoded[0..], encoded);
-
-    // Shrink the buffer to the actual decoded length
-    return allocator.realloc(decoded, encoded.len);
+    return std.mem.trimRight(u8, try allocator.realloc(decoded, encoded.len), "");
 }
