@@ -1,5 +1,5 @@
 const std = @import("std");
-const Gmail = @import("./root.zig").Gmail;
+const Gmail = @import("gmail.zig").Gmail;
 const http = std.http;
 
 pub fn main() !void {
@@ -8,7 +8,9 @@ pub fn main() !void {
     var allocator = std.heap.GeneralPurposeAllocator(.{}){};
 
     var gmail = Gmail.init(&allocator.allocator());
-    try gmail.getAuthCode();
+    try gmail.authenticate();
+
+    try gmail.listEmails();
 
     // const req = try http.client.open(http.Method.GET, "", .{});
     // try req.send();
