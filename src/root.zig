@@ -35,6 +35,33 @@ pub const Gmail = struct {
     pub fn init(allocator: *const std.mem.Allocator) Self {
         return Self{ .allocator = allocator };
     }
+    fn openUrl(url: []const u8) !void {
+        const allocator = std.heap.page_allocator;
+
+        switch (builtin.os.tag) {
+            .windows => {
+                const command = try std.fmt.allocPrint(allocator, "start {s}", .{url});
+                defer allocator.free(command);
+                try std.process.execToNull(allocator, &.{ "cmd", "/C", command });
+            },
+            .macos => {
+                try std.process.execToNull(allocator, &.{ "open", url });
+            },
+            .linux => {
+                var proc = std.process.Child.init(&.{ "dbus-launch", "--auto-syntax", "xdg-open", url }, allocator);
+                proc.stdin_behavior = .Ignore;
+                proc.stdout_behavior = .Ignore;
+                proc.stderr_behavior = .Ignore;
+
+                _ = try proc.spawnAndWait();
+                _ = try proc.kill();
+            },
+            else => {
+                std.debug.print("Unsupported operating system\n", .{});
+                return error.UnsupportedOS;
+            },
+        }
+    }
 
     fn handleRequest(self: *Self) !void {
         const Handler = struct {
@@ -136,44 +163,64 @@ pub const Gmail = struct {
             try openUrl(url);
             try self.handleRequest();
             std.debug.print("\n\n\n\nCODE {s}\n\n\n", .{code});
+            try self.exchangeCodeForToken(creds, code);
         } else |err| {
             std.debug.panic("Error opening file: {}", .{err});
         }
     }
-};
 
-export fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
+    fn exchangeCodeForToken(self: *Self, creds: Creds, auth_code: []const u8) !void {
+        const allocator = self.allocator.*;
 
-test "basic add functionality" {
-    try testing.expect(add(3, 7) == 10);
-}
+        // Prepare the request body
+        const body = try std.fmt.allocPrint(allocator, "code={s}&client_id={s}&client_secret={s}&redirect_uri={s}&grant_type=authorization_code", .{
+            auth_code,
+            creds.client_id,
+            creds.client_secret,
+            REDIRECT_URI,
+        });
+        defer allocator.free(body);
 
-fn openUrl(url: []const u8) !void {
-    const allocator = std.heap.page_allocator;
+        // Create a HTTP client
+        var client = std.http.Client{ .allocator = allocator };
+        defer client.deinit();
 
-    switch (builtin.os.tag) {
-        .windows => {
-            const command = try std.fmt.allocPrint(allocator, "start {s}", .{url});
-            defer allocator.free(command);
-            try std.process.execToNull(allocator, &.{ "cmd", "/C", command });
-        },
-        .macos => {
-            try std.process.execToNull(allocator, &.{ "open", url });
-        },
-        .linux => {
-            var proc = std.process.Child.init(&.{ "dbus-launch", "--auto-syntax", "xdg-open", url }, allocator);
-            proc.stdin_behavior = .Ignore;
-            proc.stdout_behavior = .Ignore;
-            proc.stderr_behavior = .Ignore;
+        // Prepare the request
 
-            _ = try proc.spawnAndWait();
-            _ = try proc.kill();
-        },
-        else => {
-            std.debug.print("Unsupported operating system\n", .{});
-            return error.UnsupportedOS;
-        },
+        // Send the POST request
+        var rb = std.ArrayList(u8).init(allocator);
+        var server_header_buffer: [8192]u8 = undefined;
+        const req = try client.fetch(.{
+            .server_header_buffer = &server_header_buffer,
+            .method = .POST,
+            .location = .{ .uri = try std.Uri.parse(creds.token_uri) },
+            .payload = body,
+            .headers = .{ .content_type = .{ .override = "application/x-www-form-urlencoded" } },
+            .response_storage = .{ .dynamic = &rb },
+        });
+
+        if (req.status != std.http.Status.ok) {
+            std.debug.panic("Request failed: {}", .{req.status});
+        }
+        const response = rb.items;
+
+        // Parse the JSON response
+        const TokenResponse = struct {
+            access_token: []const u8,
+            expires_in: u32,
+            refresh_token: []const u8,
+            scope: []const u8,
+            token_type: []const u8,
+        };
+
+        const parsed = try std.json.parseFromSlice(TokenResponse, allocator, response, .{});
+        defer parsed.deinit();
+
+        // Use the access token
+        std.debug.print("\n\nAccess Token: {s}\n", .{parsed.value.access_token});
+        std.debug.print("Expires In: {d} seconds\n", .{parsed.value.expires_in});
+        std.debug.print("Refresh Token: {s}\n\n", .{parsed.value.refresh_token});
+
+        // TODO: Store these tokens securely for future use
     }
-}
+};
