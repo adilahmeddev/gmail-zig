@@ -3,6 +3,7 @@ const zap = @import("zap");
 const builtin = @import("builtin");
 const Gmail = @import("gmail.zig").Gmail;
 
+const TOKEN_STORAGE_LOCATION = "./gmail_tokens.json";
 const CLIENTSECRETS_LOCATION = "./gmail.json";
 const REDIRECT_URI = "http://localhost:8888";
 const SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
@@ -31,7 +32,59 @@ const CredsDTO = struct {
 
 var code: []const u8 = undefined;
 
+fn loadStoredTokens(self: *Gmail) !bool {
+    const allocator = self.allocator.*;
+
+    // Try to open the token file
+    const file = std.fs.cwd().openFile(TOKEN_STORAGE_LOCATION, .{}) catch |err| {
+        if (err == error.FileNotFound) return false;
+        return err;
+    };
+    defer file.close();
+
+    // Read the file content
+    const content = try file.readToEndAlloc(allocator, 10 * 1024);
+    defer allocator.free(content);
+
+    const TokenFile = struct {
+        access_token: []const u8,
+        refresh_token: []const u8,
+    };
+
+    // Parse the JSON
+    const parsed = try std.json.parseFromSlice(TokenFile, allocator, content, .{});
+    defer parsed.deinit();
+
+    // Set the tokens
+    self.access_token = try allocator.dupe(u8, parsed.value.access_token);
+    self.refresh_token = try allocator.dupe(u8, parsed.value.refresh_token);
+
+    return true;
+}
+
+fn saveTokens(self: *Gmail) !void {
+    const allocator = self.allocator.*;
+
+    // Create JSON string
+    const json = try std.json.stringifyAlloc(allocator, .{
+        .access_token = self.access_token,
+        .refresh_token = self.refresh_token,
+    }, .{});
+    defer allocator.free(json);
+
+    // Write to file
+    const file = try std.fs.cwd().createFile(TOKEN_STORAGE_LOCATION, .{});
+    defer file.close();
+
+    try file.writeAll(json);
+}
+
 pub fn authenticate(self: *Gmail) !void {
+    // Try to load stored tokens first
+    if (try loadStoredTokens(self)) {
+        std.debug.print("\nLoaded stored tokens successfully\n", .{});
+        return;
+    }
     var buffer: [1024]u8 = undefined;
     var path: [std.fs.MAX_PATH_BYTES]u8 = undefined;
 
@@ -198,6 +251,9 @@ fn exchangeCodeForToken(self: *Gmail, creds: Creds, auth_code: []const u8) !void
 
     self.access_token = parsed.value.access_token;
     self.refresh_token = parsed.value.refresh_token;
+
+    // Save tokens to local storage
+    try saveTokens(self);
 }
 
 pub fn sendAuthenticatedRequest(self: *Gmail, path: []const u8, method: std.http.Method) !std.ArrayList(u8) {
